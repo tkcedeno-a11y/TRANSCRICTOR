@@ -1,6 +1,7 @@
 """Decide con Claude si algo requiere respuesta y genera esa respuesta."""
 import base64
 import sys
+import threading
 import time
 from collections import deque
 
@@ -41,8 +42,11 @@ contexto de la conversación que haga falta para entenderla. Si es false, deja "
 PROMPT_RESPUESTA = f"""Escribes lo que {config.NOMBRE_USUARIO} va a decir en voz alta en una videollamada de
 {config.ASIGNATURA}, leyéndolo de un teleprompter. {config.NOMBRE_USUARIO} es una chica joven y estudiante.
 
-Es su turno en una conversación: contesta directo a lo que le preguntaron, como respondería una persona
-en un diálogo normal, y retoma lo que se dijo antes en la transcripción si la pregunta se apoya en eso.
+Es una conversación continua. Cada mensaje trae lo nuevo que se dijo en la llamada y la pregunta; tus
+respuestas anteriores son lo que {config.NOMBRE_USUARIO} ya dijo en voz alta. Contesta como su siguiente
+turno en ese diálogo: directo a lo que le preguntaron, coherente con lo que ya dijo, sin repetirlo ni
+contradecirlo, y enlazando con ello cuando venga al caso ("como decía antes", "siguiendo con eso").
+Retoma también lo que dijeron los demás si la pregunta se apoya en eso.
 Habla en primera persona y en femenino ("yo diría", "estoy segura", "lo entendí así"). Frases cortas,
 palabras sencillas, algún conector natural como "o sea", "más o menos" o "por ejemplo", sin exagerarlos.
 Evita el tono de libro, las enumeraciones, las frases hechas de presentación, los títulos y el markdown.
@@ -90,12 +94,24 @@ class Cerebro:
         ]
         self.reunion = deque(maxlen=config.LINEAS_DE_CONTEXTO)
         self.respondidas = deque(maxlen=5)  # para no contestar dos veces lo mismo
+        # Conversacion continua: turnos anteriores (transcripcion + pregunta, respuesta de Thais)
+        self.historial = []
+        self._nuevas = deque(maxlen=40)  # lineas oidas desde la ultima respuesta
+        self._candado = threading.Lock()
         self.ultimo_uso = None
         self._t_cache = 0.0  # ultima vez que se escribio o leyo la cache de la respuesta
         self.rapido = config.MODO_RAPIDO and config.MODELO_RESPUESTA in MODELOS_CON_MODO_RAPIDO
 
     def registrar(self, linea):
         self.reunion.append(linea)
+        with self._candado:
+            self._nuevas.append(linea)
+
+    def _tomar_nuevas(self):
+        with self._candado:
+            lineas = list(self._nuevas)
+            self._nuevas.clear()
+        return lineas
 
     def marcar_respondida(self, pregunta):
         self.respondidas.append(pregunta)
@@ -107,6 +123,9 @@ class Cerebro:
             output_config={"effort": config.ESFUERZO_RESPUESTA},
             system=self.sistema,
         )
+        if config.MODELO_RESPUESTA.startswith("claude-haiku"):
+            # Sin pensamiento: responde antes y el historial queda en texto plano
+            peticion["thinking"] = {"type": "disabled"}
         betas = []
         if config.MODELO_RESPUESTA in MODELOS_CON_RESPALDO:
             betas.append(BETA_RESPALDO)
@@ -168,19 +187,36 @@ class Cerebro:
         with self.cliente.beta.messages.stream(
             max_tokens=2048,
             messages=mensajes,
+            # Ademas del material, cachea el historial: cada turno solo paga lo nuevo
+            cache_control={"type": "ephemeral", "ttl": "1h"},
             **self._peticion_respuesta(),
         ) as flujo:
             yield from flujo.text_stream
             return flujo.get_final_message()
 
+    def _guardar_turno(self, texto_usuario, respuesta):
+        """Agrega el turno al historial (solo crece por el final, asi la cache sigue valiendo)."""
+        self.historial += [
+            {"role": "user", "content": texto_usuario},
+            {"role": "assistant", "content": respuesta},
+        ]
+        exceso = len(self.historial) - 2 * config.TURNOS_DE_CONVERSACION
+        if exceso > 0:
+            del self.historial[:exceso]  # se olvidan los turnos mas viejos
+
     def responder(self, pregunta, imagen=None):
-        """Genera la respuesta; devuelve fragmentos de texto a medida que llegan."""
-        contexto = "\n".join(self.reunion)
-        contenido = [{"type": "text", "text": f"<transcripcion>\n{contexto}\n</transcripcion>\n\n{pregunta}"}]
+        """Genera la respuesta como siguiente turno de la conversacion; devuelve fragmentos de texto."""
+        nuevas = self._tomar_nuevas()
+        if not nuevas and not self.historial:
+            nuevas = list(self.reunion)  # primer turno: algo de contexto aunque ya se haya consumido
+        texto = f"<pregunta>\n{pregunta}\n</pregunta>"
+        if nuevas:
+            texto = "<transcripcion>\n" + "\n".join(nuevas) + "\n</transcripcion>\n\n" + texto
+        contenido = [{"type": "text", "text": texto}]
         if imagen:
             datos = base64.standard_b64encode(imagen).decode("utf-8")
             contenido.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": datos}})
-        mensajes = [{"role": "user", "content": contenido}]
+        mensajes = self.historial + [{"role": "user", "content": contenido}]
         try:
             final = yield from self._emitir(mensajes)
         except anthropic.RateLimitError:
@@ -192,6 +228,10 @@ class Cerebro:
             self._t_cache = 0.0
             final = yield from self._emitir(mensajes)
         self._t_cache = time.monotonic()  # cada lectura renueva el TTL
+        dicho = "".join(b.text for b in final.content if b.type == "text").strip()
+        if final.stop_reason != "refusal" and dicho:
+            # La captura no se guarda (pesa mucho): queda una nota en su lugar
+            self._guardar_turno(("[Captura de pantalla]\n" if imagen else "") + texto, dicho)
         if final.stop_reason == "refusal":
             yield "\n[Claude no respondió esta pregunta.]"
         elif final.stop_reason == "max_tokens":

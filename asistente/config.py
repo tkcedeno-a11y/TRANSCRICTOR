@@ -17,7 +17,8 @@ MODELO_FILTRO = "claude-haiku-5-5"
 MODELO_RESPUESTA = "claude-haiku-5-5"  # el mas barato; "claude-sonnet-5-5" u "claude-opus-5-5" responden mejor
 MODO_RAPIDO = True  # solo aplica con Opus: genera hasta 2.5x mas rapido al doble de precio
 ESFUERZO_RESPUESTA = "low"  # low responde antes; sube a medium si quieres mas profundidad
-LINEAS_DE_CONTEXTO = 12  # lineas recientes de la reunion que ve cada modelo
+LINEAS_DE_CONTEXTO = 12  # lineas recientes de la reunion que ve el filtro
+TURNOS_DE_CONVERSACION = 10  # preguntas y respuestas anteriores que recuerda al responder
 
 # Transcripcion local
 MODELO_WHISPER = "base"  # en CPU ~1.5 s por frase
