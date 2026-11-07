@@ -29,15 +29,48 @@ def _buscar_loopback(p):
     raise RuntimeError("No hay dispositivo loopback para " + salida["name"])
 
 
-def _a_mono_frecuencia(datos, canales, frecuencia_origen):
-    """Convierte bytes float32 intercalados a mono float32 a FRECUENCIA Hz."""
+def _a_mono(datos, canales):
+    """Convierte bytes float32 intercalados a mono float32."""
     x = np.frombuffer(datos, dtype=np.float32)
     if canales > 1:
         x = x.reshape(-1, canales).mean(axis=1)
-    if frecuencia_origen != FRECUENCIA and len(x) > 1:
-        n_salida = int(round(len(x) * FRECUENCIA / frecuencia_origen))
-        x = np.interp(np.linspace(0, len(x) - 1, n_salida), np.arange(len(x)), x)
-    return x.astype(np.float32)
+    return x
+
+
+class _Remuestreador:
+    """Pasa audio por bloques a FRECUENCIA Hz sin cortes entre bloques.
+
+    Antes de bajar la frecuencia aplica un filtro paso bajo: sin el, lo que suena por encima
+    de 8 kHz (sibilantes, musica, ruido) se pliega sobre la banda de la voz y Whisper se equivoca mas.
+    """
+
+    def __init__(self, origen, destino=FRECUENCIA, coeficientes=63):
+        self.paso = origen / destino
+        self.filtro = None
+        if origen > destino:
+            corte = 0.45 * destino / origen  # en ciclos por muestra, algo bajo la mitad de destino
+            n = np.arange(coeficientes) - (coeficientes - 1) / 2
+            h = 2 * corte * np.sinc(2 * corte * n) * np.hamming(coeficientes)
+            self.filtro = (h / h.sum()).astype(np.float32)
+            self.cola = np.zeros(coeficientes - 1, dtype=np.float32)
+        self.pos = 0.0  # posicion de la siguiente muestra de salida dentro del bloque actual
+        self.ultimo = 0.0  # ultima muestra del bloque anterior, para interpolar en la union
+
+    def __call__(self, x):
+        if self.paso == 1 or len(x) == 0:
+            return x.astype(np.float32)
+        if self.filtro is not None:
+            ext = np.concatenate([self.cola, x])
+            y = np.convolve(ext, self.filtro, mode="valid")
+            self.cola = ext[-(len(self.filtro) - 1):]
+        else:
+            y = x
+        tiempos = np.arange(self.pos, len(y) - 1 + 1e-9, self.paso)
+        # el indice 0 de ext es la ultima muestra del bloque anterior (tiempo -1)
+        salida = np.interp(tiempos + 1, np.arange(len(y) + 1), np.concatenate([[self.ultimo], y]))
+        self.pos = (tiempos[-1] + self.paso if len(tiempos) else self.pos) - len(y)
+        self.ultimo = y[-1]
+        return salida.astype(np.float32)
 
 
 class CapturaAudio:
@@ -94,13 +127,14 @@ class CapturaAudio:
                 stream_callback=self._callback_audio,
             )
             stream.start_stream()
+            remuestrear = _Remuestreador(frecuencia)
             while self._activo:
                 try:
                     datos = self._cola.get(timeout=0.1)
                 except queue.Empty:
                     self._sin_datos()
                     continue
-                self._procesar(_a_mono_frecuencia(datos, canales, frecuencia))
+                self._procesar(remuestrear(_a_mono(datos, canales)))
         except Exception as e:
             print(f"[captura] error: {e}", file=sys.stderr)
         finally:

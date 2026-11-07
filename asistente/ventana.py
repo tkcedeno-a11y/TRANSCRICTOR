@@ -8,13 +8,24 @@ import sys
 from ctypes import wintypes
 
 from PySide6.QtCore import QBuffer, QIODevice, QObject, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen, QTextCursor
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizeGrip,
+    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -23,6 +34,18 @@ from PySide6.QtWidgets import (
 ANCHO, ALTO = 860, 240
 RADIO = 18
 MAX_LADO_CAPTURA = 1568  # mas alla Claude la reduce igual
+REFRESCO_MS = 60  # el texto que llega se pinta en tandas, no letra a letra (evita parpadeo)
+MAX_BLOQUES = 60  # parrafos que se conservan; los mas viejos se borran solos
+
+
+def _formato(color, px, peso):
+    fuente = QFont("Segoe UI")
+    fuente.setPixelSize(px)
+    fuente.setWeight(peso)
+    formato = QTextCharFormat()
+    formato.setFont(fuente)
+    formato.setForeground(QColor(color))
+    return formato
 
 ESTILO = """
 QLabel#estado { color: rgba(255,255,255,190); font: 600 12px 'Segoe UI'; }
@@ -89,13 +112,20 @@ class Ventana(QWidget):
         self._al_play = al_play
         self._al_capturar = al_capturar
         self._senales = _Senales()
+        self._pendiente = []  # fragmentos recibidos que aun no se pintaron
+        self._formato_pregunta = _formato("#a8e6ff", 14, QFont.Weight.DemiBold)
+        self._formato_respuesta = _formato("white", 23, QFont.Weight.DemiBold)
         self._construir()
+        self._refresco = QTimer(self)
+        self._refresco.setSingleShot(True)
+        self._refresco.setInterval(REFRESCO_MS)
+        self._refresco.timeout.connect(self._volcar)
         s = self._senales
         s.estado.connect(self._etiqueta.setText)
         s.nivel.connect(self._poner_nivel)
         s.nueva.connect(self._poner_pregunta)
         s.texto.connect(self._agregar)
-        s.fin.connect(lambda: None)
+        s.fin.connect(self._volcar)
         s.escucha.connect(self._poner_escucha)
 
     def _construir(self):
@@ -126,6 +156,8 @@ class Ventana(QWidget):
         botones.addStretch()
 
         self._etiqueta = QLabel("Cargando...", objectName="estado")
+        # Ignored: un texto de estado largo no reacomoda (ni hace parpadear) la ventana
+        self._etiqueta.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._medidor = _Medidor()
         cerrar = QPushButton("✕", objectName="cerrar")
         cerrar.setFixedSize(22, 22)
@@ -140,6 +172,8 @@ class Ventana(QWidget):
         self._texto.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._texto.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._texto.setOpenExternalLinks(False)
+        self._texto.setUndoRedoEnabled(False)
+        self._texto.document().setMaximumBlockCount(MAX_BLOQUES)
 
         derecha = QVBoxLayout()
         derecha.setSpacing(6)
@@ -197,6 +231,8 @@ class Ventana(QWidget):
         self._boton_play.style().polish(self._boton_play)
 
     def _poner_nivel(self, rms):
+        if abs(rms - self._medidor.valor) < 0.002:
+            return  # sin cambio visible: no repintar
         self._medidor.valor = rms
         self._medidor.update()
 
@@ -215,19 +251,59 @@ class Ventana(QWidget):
         imagen.save(memoria, "PNG")
         self._al_capturar(bytes(memoria.data()))
 
+    def _al_final(self):
+        """Cursor propio al final del documento: no mueve el cursor visible ni hace saltar la vista."""
+        cursor = QTextCursor(self._texto.document())
+        cursor.movePosition(QTextCursor.End)
+        return cursor
+
+    def _escribir(self, escribir):
+        """Aplica un cambio al texto y, si se estaba viendo el final, sigue mostrando el final."""
+        barra = self._texto.verticalScrollBar()
+        seguir = barra.value() >= barra.maximum() - 4
+        escribir()
+        if seguir:
+            barra.setValue(barra.maximum())
+
     def _poner_pregunta(self, pregunta):
-        self._texto.clear()
-        cursor = self._texto.textCursor()
-        cursor.insertHtml(f'<span style="color:#a8e6ff;font-size:14px;font-weight:600">{_escapar(pregunta)}</span><br>')
-        self._texto.setTextCursor(cursor)
+        # La respuesta anterior se queda arriba (como en un chat) en vez de borrarse de golpe
+        self._volcar()
+
+        def escribir():
+            cursor = self._al_final()
+            vacio = self._texto.document().isEmpty()
+            bloque = QTextBlockFormat()
+            bloque.setTopMargin(0 if vacio else 14)
+            if vacio:
+                cursor.setBlockFormat(bloque)
+            else:
+                cursor.insertBlock(bloque)
+            cursor.insertText(pregunta, self._formato_pregunta)
+            cursor.insertBlock(QTextBlockFormat())
+
+        self._escribir(escribir)
 
     def _agregar(self, delta):
-        cursor = self._texto.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertHtml(f'<span style="color:white;font-size:23px;font-weight:600">{_escapar(delta)}</span>')
-        self._texto.setTextCursor(cursor)
-        barra = self._texto.verticalScrollBar()
-        barra.setValue(barra.maximum())
+        self._pendiente.append(delta)
+        if not self._refresco.isActive():
+            self._refresco.start()
+
+    def _volcar(self):
+        self._refresco.stop()
+        if not self._pendiente:
+            return
+        texto = "".join(self._pendiente)
+        self._pendiente.clear()
+
+        def escribir():
+            cursor = self._al_final()
+            for i, parte in enumerate(texto.split("\n")):
+                if i:
+                    cursor.insertBlock(QTextBlockFormat())
+                if parte:
+                    cursor.insertText(parte, self._formato_respuesta)
+
+        self._escribir(escribir)
 
     # Interfaz para otros hilos
     def estado(self, texto):
@@ -252,6 +328,3 @@ class Ventana(QWidget):
         self.show()
         self._app.exec()
 
-
-def _escapar(texto):
-    return texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
