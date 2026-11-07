@@ -1,0 +1,4 @@
+playwright
+pywin32
+pillow
+pypdfium2

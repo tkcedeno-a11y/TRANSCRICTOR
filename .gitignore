@@ -1,0 +1,14 @@
+# Secretos
+.env
+.sesion.json
+
+# Entornos y cache
+.venv/
+__pycache__/
+*.pyc
+
+# Material del curso y lo derivado de el
+Temas - */
+inventario.json
+asistente/base_conocimiento.txt
+asistente/banco/

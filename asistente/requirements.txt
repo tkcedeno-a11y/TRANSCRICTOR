@@ -1,0 +1,7 @@
+anthropic
+faster-whisper
+pyaudiowpatch
+numpy
+pypdf
+python-dotenv
+PySide6-Essentials
