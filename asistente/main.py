@@ -3,7 +3,8 @@ import os
 import queue
 import sys
 import threading
-from difflib import SequenceMatcher
+import re
+import unicodedata
 
 import anthropic
 from dotenv import load_dotenv
@@ -27,6 +28,19 @@ def describir(error):
         return "Sin conexión con Claude"
     print(f"[asistente] {error!r}", file=sys.stderr)
     return f"Error: {error}"
+
+
+# Palabras que no cambian de que trata una pregunta
+_RELLENO = set("""
+a al alguien algo como con cual cuales cuando de del el ella ellos en entre es esta este esto explica
+explicar explicame explicarnos la las le les lo los me mi nos o para pero podria podrias por puede
+puedes que quien se ser si sobre son su sus te tu un una uno unos unas y ya hay dime decir digan
+""".split())
+
+
+def _palabras_clave(texto):
+    sin_tildes = unicodedata.normalize("NFKD", texto.casefold()).encode("ascii", "ignore").decode()
+    return frozenset(p for p in re.findall(r"\w+", sin_tildes) if p not in _RELLENO)
 
 
 class Asistente:
@@ -139,12 +153,14 @@ class Asistente:
             self.preguntas.put((pregunta, None))
 
     def repetida(self, pregunta):
-        """True si se parece mucho a una pregunta ya respondida (Claude a veces la reformula)."""
-        nueva = pregunta.casefold()
-        return any(
-            SequenceMatcher(None, nueva, previa.casefold()).ratio() >= 0.75
-            for previa in self.cerebro.respondidas
-        )
+        """True si pregunta lo mismo que una ya respondida, con otras palabras de relleno.
+
+        Compara solo las palabras con contenido: "¿Qué es la oferta?" y "¿Qué es la demanda?"
+        se parecen letra a letra pero son preguntas distintas. Las reformulaciones mas libres
+        las descarta el filtro de Claude, que recibe la lista de ya respondidas.
+        """
+        nueva = _palabras_clave(pregunta)
+        return bool(nueva) and any(nueva == _palabras_clave(previa) for previa in self.cerebro.respondidas)
 
     def siguiente_pregunta(self):
         """Espera una pregunta; si se acumularon varias, salta a la mas reciente (las capturas no se saltan)."""
