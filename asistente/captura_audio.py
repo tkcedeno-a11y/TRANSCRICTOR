@@ -88,6 +88,11 @@ class CapturaAudio:
         self._n_silencio = 0
         self._previo = np.zeros(0, dtype=np.float32)
 
+    @property
+    def hablando(self):
+        """True mientras hay una frase en curso (alguien esta hablando ahora mismo)."""
+        return self._activo and self._en_frase
+
     def iniciar(self):
         if self._hilo is not None and self._hilo.is_alive():
             return

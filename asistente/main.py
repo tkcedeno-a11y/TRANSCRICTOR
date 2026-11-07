@@ -3,6 +3,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import re
 import unicodedata
 
@@ -129,9 +130,30 @@ class Asistente:
                 self.lineas.put(texto)
 
     def bucle_filtro(self):
-        # Hilo aparte: esperar a Claude no debe frenar la transcripcion
+        """Clasifica lo que se oye y lanza la respuesta cuando la pregunta termino.
+
+        Una pregunta larga llega en varias frases. En vez de responder a la primera parte, se
+        guarda como pendiente, se actualiza con cada frase nueva (Claude la reescribe completa)
+        y solo se responde tras config.ESPERA_FIN_PREGUNTA_S sin frases nuevas ni voz.
+        """
+        pendiente = None
+        t_ultima = 0.0
         while True:
-            lineas = [self.lineas.get()]
+            espera = None
+            if pendiente:
+                espera = max(0.05, t_ultima + config.ESPERA_FIN_PREGUNTA_S - time.monotonic())
+            try:
+                lineas = [self.lineas.get(timeout=espera)]
+            except queue.Empty:
+                hablando = self.captura.hablando
+                tope = time.monotonic() - t_ultima >= config.ESPERA_MAX_PREGUNTA_S
+                if hablando and not tope:
+                    continue  # sigue hablando: puede estar terminando la pregunta
+                if not self.repetida(pendiente):
+                    self.cerebro.marcar_respondida(pendiente)
+                    self.preguntas.put((pendiente, None))
+                pendiente = None
+                continue
             # Si se acumularon lineas mientras Claude clasificaba, se registran todas
             # y se clasifica solo la ultima: evita ir cada vez mas atrasado
             while True:
@@ -139,18 +161,18 @@ class Asistente:
                     lineas.append(self.lineas.get_nowait())
                 except queue.Empty:
                     break
+            t_ultima = time.monotonic()
             try:
                 for linea in lineas:
                     self.cerebro.registrar(linea)
-                clasificacion = self.cerebro.clasificar()
+                clasificacion = self.cerebro.clasificar(pendiente)
             except Exception as e:
                 self.ventana.estado(describir(e))
                 continue
             pregunta = clasificacion.pregunta.strip()
-            if not (clasificacion.responder and pregunta) or self.repetida(pregunta):
-                continue
-            self.cerebro.marcar_respondida(pregunta)
-            self.preguntas.put((pregunta, None))
+            if clasificacion.responder and pregunta and not self.repetida(pregunta):
+                pendiente = pregunta  # la version mas reciente es la mas completa
+                self.ventana.estado("Pregunta detectada: esperando a que termine...")
 
     def repetida(self, pregunta):
         """True si pregunta lo mismo que una ya respondida, con otras palabras de relleno.
