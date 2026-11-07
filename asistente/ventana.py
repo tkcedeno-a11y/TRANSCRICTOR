@@ -36,6 +36,7 @@ RADIO = 18
 MAX_LADO_CAPTURA = 1568  # mas alla Claude la reduce igual
 REFRESCO_MS = 60  # el texto que llega se pinta en tandas, no letra a letra (evita parpadeo)
 MAX_BLOQUES = 60  # parrafos que se conservan; los mas viejos se borran solos
+WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
 def _formato(color, px, peso):
@@ -77,6 +78,17 @@ def aplicar_cristal(hwnd):
     ctypes.windll.user32.SetWindowCompositionAttribute(wintypes.HWND(hwnd), ctypes.byref(datos))
     esquina = ctypes.c_int(2)  # DWMWCP_ROUND
     ctypes.windll.dwmapi.DwmSetWindowAttribute(wintypes.HWND(hwnd), 33, ctypes.byref(esquina), ctypes.sizeof(esquina))
+
+
+def excluir_de_capturas(hwnd):
+    """Mantiene la ventana visible localmente y la excluye de capturas de pantalla en Windows 10 2004+."""
+    if sys.getwindowsversion().build < 19041:
+        return False
+
+    funcion = ctypes.windll.user32.SetWindowDisplayAffinity
+    funcion.argtypes = (wintypes.HWND, wintypes.DWORD)
+    funcion.restype = wintypes.BOOL
+    return bool(funcion(wintypes.HWND(hwnd), WDA_EXCLUDEFROMCAPTURE))
 
 
 class _Senales(QObject):
@@ -192,7 +204,9 @@ class Ventana(QWidget):
 
     def showEvent(self, evento):
         super().showEvent(evento)
-        aplicar_cristal(int(self.winId()))
+        hwnd = int(self.winId())
+        aplicar_cristal(hwnd)
+        excluir_de_capturas(hwnd)
 
     def paintEvent(self, _evento):
         p = QPainter(self)
@@ -325,6 +339,8 @@ class Ventana(QWidget):
         self._senales.escucha.emit(activo)
 
     def ejecutar(self):
+        # Aplicar la exclusion antes de que DWM muestre la ventana por primera vez.
+        excluir_de_capturas(int(self.winId()))
         self.show()
         self._app.exec()
 
