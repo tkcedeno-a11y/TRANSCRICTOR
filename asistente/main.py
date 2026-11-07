@@ -3,6 +3,7 @@ import os
 import queue
 import sys
 import threading
+from difflib import SequenceMatcher
 
 import anthropic
 from dotenv import load_dotenv
@@ -38,7 +39,6 @@ class Asistente:
         self.base = None
         self.clave = None
         self.cerebro = None
-        self.ultima_pregunta = ""
         self.ventana = Ventana(self.al_play, self.al_capturar)
         self.captura = CapturaAudio(self.al_fragmento)
 
@@ -133,13 +133,37 @@ class Asistente:
                 self.ventana.estado(describir(e))
                 continue
             pregunta = clasificacion.pregunta.strip()
-            if clasificacion.responder and pregunta and pregunta != self.ultima_pregunta:
-                self.ultima_pregunta = pregunta
-                self.preguntas.put((pregunta, None))
+            if not (clasificacion.responder and pregunta) or self.repetida(pregunta):
+                continue
+            self.cerebro.marcar_respondida(pregunta)
+            self.preguntas.put((pregunta, None))
+
+    def repetida(self, pregunta):
+        """True si se parece mucho a una pregunta ya respondida (Claude a veces la reformula)."""
+        nueva = pregunta.casefold()
+        return any(
+            SequenceMatcher(None, nueva, previa.casefold()).ratio() >= 0.75
+            for previa in self.cerebro.respondidas
+        )
+
+    def siguiente_pregunta(self):
+        """Espera una pregunta; si se acumularon varias, salta a la mas reciente (las capturas no se saltan)."""
+        pendientes = [self.preguntas.get()]
+        while True:
+            try:
+                pendientes.append(self.preguntas.get_nowait())
+            except queue.Empty:
+                break
+        capturas = [p for p in pendientes if p[1]]
+        habladas = [p for p in pendientes if not p[1]]
+        elegidas = capturas + habladas[-1:]
+        for resto in elegidas[1:]:
+            self.preguntas.put(resto)
+        return elegidas[0]
 
     def bucle_respuestas(self):
         while True:
-            pregunta, imagen = self.preguntas.get()
+            pregunta, imagen = self.siguiente_pregunta()
             self.ventana.nueva_respuesta("Captura de pantalla" if imagen else pregunta)
             try:
                 for delta in self.cerebro.responder(pregunta, imagen):

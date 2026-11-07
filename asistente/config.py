@@ -14,7 +14,7 @@ ASIGNATURA = "Microeconomía I"
 
 # Claude
 MODELO_FILTRO = "claude-haiku-5-5"
-MODELO_RESPUESTA = "claude-sonnet-5-5"  # mas rapido y la mitad de precio; "claude-opus-5-5" responde mejor
+MODELO_RESPUESTA = "claude-haiku-5-5"  # el mas barato; "claude-sonnet-5-5" u "claude-opus-5-5" responden mejor
 MODO_RAPIDO = True  # solo aplica con Opus: genera hasta 2.5x mas rapido al doble de precio
 ESFUERZO_RESPUESTA = "low"  # low responde antes; sube a medium si quieres mas profundidad
 LINEAS_DE_CONTEXTO = 12  # lineas recientes de la reunion que ve cada modelo
