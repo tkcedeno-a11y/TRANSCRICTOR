@@ -7,14 +7,16 @@ import ctypes
 import sys
 from ctypes import wintypes
 
-from PySide6.QtCore import QBuffer, QIODevice, QObject, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QBuffer, QEvent, QIODevice, QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
@@ -26,6 +28,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizeGrip,
     QSizePolicy,
+    QMenu,
+    QSystemTrayIcon,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -121,6 +125,9 @@ class Ventana(QWidget):
         """al_play(activo) devuelve True si pudo cambiar; al_capturar(png: bytes)."""
         self._app = QApplication.instance() or QApplication(sys.argv)
         super().__init__()
+        self._bandeja_disponible = QSystemTrayIcon.isSystemTrayAvailable()
+        if self._bandeja_disponible:
+            self._app.setQuitOnLastWindowClosed(False)
         self._al_play = al_play
         self._al_capturar = al_capturar
         self._senales = _Senales()
@@ -128,6 +135,7 @@ class Ventana(QWidget):
         self._formato_pregunta = _formato("#a8e6ff", 14, QFont.Weight.DemiBold)
         self._formato_respuesta = _formato("white", 23, QFont.Weight.DemiBold)
         self._construir()
+        self._crear_bandeja()
         self._refresco = QTimer(self)
         self._refresco.setSingleShot(True)
         self._refresco.setInterval(REFRESCO_MS)
@@ -142,7 +150,10 @@ class Ventana(QWidget):
 
     def _construir(self):
         self.setWindowTitle("Asistente")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        banderas = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        if self._bandeja_disponible:
+            banderas |= Qt.Tool  # ventana sin boton en la barra de tareas
+        self.setWindowFlags(banderas)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setStyleSheet(ESTILO)
         self.resize(ANCHO, ALTO)
@@ -202,8 +213,92 @@ class Ventana(QWidget):
         fila.addLayout(botones)
         fila.addLayout(derecha, 1)
 
+    def _crear_bandeja(self):
+        self._bandeja = None
+        self._accion_ventana = None
+        self._accion_escucha = None
+        if not self._bandeja_disponible:
+            return
+
+        self._bandeja = QSystemTrayIcon(self)
+        self._bandeja.setIcon(self._icono_bandeja())
+        self._bandeja.setToolTip("Transcriptor Thais")
+        menu = QMenu(self)
+        self._accion_ventana = menu.addAction("")
+        self._accion_ventana.triggered.connect(self._alternar_visibilidad)
+        menu.addSeparator()
+        self._accion_escucha = menu.addAction("")
+        self._accion_escucha.triggered.connect(self._alternar)
+        menu.addAction("Capturar pantalla", self._capturar)
+        menu.addSeparator()
+        menu.addAction("Salir", self._salir)
+        self._bandeja.setContextMenu(menu)
+        self._bandeja.activated.connect(self._bandeja_activada)
+        self._bandeja.show()
+        self._actualizar_menu_bandeja()
+
+    @staticmethod
+    def _icono_bandeja():
+        imagen = QPixmap(32, 32)
+        imagen.fill(Qt.transparent)
+        pintor = QPainter(imagen)
+        pintor.setRenderHint(QPainter.Antialiasing)
+        pintor.setPen(Qt.NoPen)
+        pintor.setBrush(QColor("#173448"))
+        pintor.drawEllipse(1, 1, 30, 30)
+        pintor.setPen(QPen(QColor("#a8e6ff"), 3))
+        pintor.drawLine(9, 10, 23, 10)
+        pintor.drawLine(16, 10, 16, 24)
+        pintor.end()
+        return QIcon(imagen)
+
+    def _actualizar_menu_bandeja(self):
+        if self._accion_ventana is not None:
+            self._accion_ventana.setText("Ocultar ventana" if self.isVisible() else "Mostrar ventana")
+        if self._accion_escucha is not None:
+            activo = bool(self._boton_play.property("activo"))
+            self._accion_escucha.setText("Detener escucha" if activo else "Iniciar escucha")
+
+    def _alternar_visibilidad(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def _bandeja_activada(self, razon):
+        if razon in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._alternar_visibilidad()
+
+    def _salir(self):
+        if self._bandeja is not None:
+            self._bandeja.hide()
+        self._app.quit()
+
+    def closeEvent(self, evento):
+        if self._bandeja_disponible:
+            evento.ignore()
+            self.hide()
+        else:
+            evento.accept()
+
+    def changeEvent(self, evento):
+        super().changeEvent(evento)
+        if (
+            self._bandeja_disponible
+            and evento.type() == QEvent.Type.WindowStateChange
+            and self.isMinimized()
+        ):
+            QTimer.singleShot(0, self.hide)
+
+    def hideEvent(self, evento):
+        super().hideEvent(evento)
+        self._actualizar_menu_bandeja()
+
     def showEvent(self, evento):
         super().showEvent(evento)
+        self._actualizar_menu_bandeja()
         hwnd = int(self.winId())
         aplicar_cristal(hwnd)
         excluir_de_capturas(hwnd)
@@ -243,6 +338,7 @@ class Ventana(QWidget):
         self._boton_play.setProperty("activo", activo)
         self._boton_play.style().unpolish(self._boton_play)
         self._boton_play.style().polish(self._boton_play)
+        self._actualizar_menu_bandeja()
 
     def _poner_nivel(self, rms):
         if abs(rms - self._medidor.valor) < 0.002:
