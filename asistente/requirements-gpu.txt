@@ -1,0 +1,4 @@
+# Opcional: transcripcion en GPU NVIDIA (CUDA 12 + cuDNN 9 para ctranslate2 4.x)
+# pip install -r requirements-gpu.txt
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*

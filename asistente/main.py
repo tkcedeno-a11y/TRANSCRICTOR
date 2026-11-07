@@ -61,6 +61,8 @@ class Asistente:
                 return False
             if not self.preparar_cerebro():
                 return False
+            # Precalienta cache y conexion mientras empieza la reunion
+            threading.Thread(target=self.cerebro.calentar, daemon=True).start()
             self.captura.iniciar()
             self.ventana.estado("Escuchando")
         else:
@@ -92,7 +94,8 @@ class Asistente:
         for bucle in (self.bucle_transcripcion, self.bucle_filtro, self.bucle_respuestas, self.bucle_nivel):
             threading.Thread(target=bucle, daemon=True).start()
         self.listo = True
-        self.ventana.estado("Listo: pulsa ▶ para escuchar")
+        motor = "GPU" if self.transcriptor.dispositivo == "cuda" else "CPU"
+        self.ventana.estado(f"Listo ({motor}): pulsa ▶ para escuchar")
 
     def bucle_nivel(self):
         evento = threading.Event()
@@ -114,9 +117,17 @@ class Asistente:
     def bucle_filtro(self):
         # Hilo aparte: esperar a Claude no debe frenar la transcripcion
         while True:
-            linea = self.lineas.get()
+            lineas = [self.lineas.get()]
+            # Si se acumularon lineas mientras Claude clasificaba, se registran todas
+            # y se clasifica solo la ultima: evita ir cada vez mas atrasado
+            while True:
+                try:
+                    lineas.append(self.lineas.get_nowait())
+                except queue.Empty:
+                    break
             try:
-                self.cerebro.registrar(linea)
+                for linea in lineas:
+                    self.cerebro.registrar(linea)
                 clasificacion = self.cerebro.clasificar()
             except Exception as e:
                 self.ventana.estado(describir(e))

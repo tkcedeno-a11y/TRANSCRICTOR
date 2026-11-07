@@ -1,5 +1,7 @@
 """Decide con Claude si algo requiere respuesta y genera esa respuesta."""
 import base64
+import sys
+import time
 from collections import deque
 
 import anthropic
@@ -8,6 +10,11 @@ from pydantic import BaseModel
 import config
 
 BETA_RESPALDO = "server-side-fallback-2026-07-01"
+BETA_RAPIDO = "fast-mode-2026-02-01"
+MODELOS_CON_MODO_RAPIDO = ("claude-opus-5-5", "claude-opus-5", "claude-opus-4-8")
+TTL_CACHE_S = 3600
+RECALENTAR_TRAS_S = 50 * 60  # se recalienta antes de que caduque la cache de 1 h
+KEEPALIVE_S = 120  # mantiene viva la conexion TLS entre preguntas (httpx cierra a los 5 s)
 
 PROMPT_FILTRO = f"""Analizas la transcripción automática de una videollamada en español.
 Ayudas a {config.NOMBRE_USUARIO} {config.APELLIDO_USUARIO}, estudiante de {config.ASIGNATURA}.
@@ -50,30 +57,99 @@ class Clasificacion(BaseModel):
     pregunta: str
 
 
+def _cliente_http():
+    """Cliente HTTP del SDK con keep-alive largo: evita repetir el handshake TLS en cada pregunta."""
+    try:
+        limites = anthropic.DEFAULT_CONNECTION_LIMITS
+        return anthropic.DefaultHttpxClient(
+            limits=type(limites)(
+                max_connections=limites.max_connections,
+                max_keepalive_connections=limites.max_keepalive_connections,
+                keepalive_expiry=KEEPALIVE_S,
+            )
+        )
+    except Exception:
+        return None  # version del SDK sin estas utilidades: se usa el cliente por defecto
+
+
 class Cerebro:
     def __init__(self, base):
-        self.cliente = anthropic.Anthropic(timeout=60.0)
+        self.cliente = anthropic.Anthropic(timeout=60.0, http_client=_cliente_http())
         self.sistema = [
             {"type": "text", "text": PROMPT_RESPUESTA + base, "cache_control": {"type": "ephemeral", "ttl": "1h"}}
         ]
         self.reunion = deque(maxlen=config.LINEAS_DE_CONTEXTO)
         self.ultimo_uso = None
+        self._t_cache = 0.0  # ultima vez que se escribio o leyo la cache de la respuesta
+        self.rapido = config.MODO_RAPIDO and config.MODELO_RESPUESTA in MODELOS_CON_MODO_RAPIDO
 
     def registrar(self, linea):
         self.reunion.append(linea)
 
-    def clasificar(self):
-        """Clasifica la ultima linea registrada con el modelo barato."""
-        lineas = "\n".join(self.reunion)
+    def _peticion_respuesta(self):
+        """Parametros comunes a la respuesta real y al precalentado (deben coincidir para compartir cache)."""
+        peticion = dict(
+            model=config.MODELO_RESPUESTA,
+            betas=[BETA_RESPALDO],
+            fallbacks="default",
+            output_config={"effort": config.ESFUERZO_RESPUESTA},
+            system=self.sistema,
+        )
+        if self.rapido:
+            peticion["betas"] = [BETA_RESPALDO, BETA_RAPIDO]
+            peticion["speed"] = "fast"
+        return peticion
+
+    def calentar(self):
+        """Precalienta la cache del material del curso y el esquema del filtro.
+
+        Asi la primera pregunta no paga la escritura de cache ni la compilacion del esquema.
+        """
+        if time.monotonic() - self._t_cache < RECALENTAR_TRAS_S and self._t_cache:
+            return
+        # max_tokens=0: solo prefill, escribe la cache y vuelve sin generar
+        peticion = dict(max_tokens=0, messages=[{"role": "user", "content": "precalentar"}], **self._peticion_respuesta())
+        try:
+            try:
+                self.cliente.beta.messages.create(**peticion)
+            except anthropic.BadRequestError:
+                # por si el respaldo no admite max_tokens=0: la cache no depende de el
+                for clave in ("betas", "fallbacks"):
+                    peticion.pop(clave)
+                self.cliente.messages.create(**peticion)
+            self._t_cache = time.monotonic()
+        except Exception as e:
+            print(f"[cerebro] no se pudo precalentar la respuesta: {e!r}", file=sys.stderr)
+        try:
+            self._clasificar_texto("Hola, ¿me escuchan?")
+        except Exception as e:
+            print(f"[cerebro] no se pudo precalentar el filtro: {e!r}", file=sys.stderr)
+
+    def _clasificar_texto(self, lineas):
         respuesta = self.cliente.messages.parse(
             model=config.MODELO_FILTRO,
-            max_tokens=1024,
+            max_tokens=256,
+            thinking={"type": "disabled"},  # clasificar no necesita razonar: sin espera por pensamiento
             output_config={"effort": "low"},
             system=PROMPT_FILTRO,
             messages=[{"role": "user", "content": f"<transcripcion>\n{lineas}\n</transcripcion>"}],
             output_format=Clasificacion,
         )
         return respuesta.parsed_output
+
+    def clasificar(self):
+        """Clasifica la ultima linea registrada con el modelo barato."""
+        return self._clasificar_texto("\n".join(self.reunion))
+
+    def _emitir(self, mensajes):
+        """Emite los fragmentos de una respuesta y devuelve el mensaje final."""
+        with self.cliente.beta.messages.stream(
+            max_tokens=2048,
+            messages=mensajes,
+            **self._peticion_respuesta(),
+        ) as flujo:
+            yield from flujo.text_stream
+            return flujo.get_final_message()
 
     def responder(self, pregunta, imagen=None):
         """Genera la respuesta; devuelve fragmentos de texto a medida que llegan."""
@@ -82,17 +158,18 @@ class Cerebro:
         if imagen:
             datos = base64.standard_b64encode(imagen).decode("utf-8")
             contenido.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": datos}})
-        with self.cliente.beta.messages.stream(
-            model=config.MODELO_RESPUESTA,
-            max_tokens=2048,
-            betas=[BETA_RESPALDO],
-            fallbacks="default",
-            output_config={"effort": config.ESFUERZO_RESPUESTA},
-            system=self.sistema,
-            messages=[{"role": "user", "content": contenido}],
-        ) as flujo:
-            yield from flujo.text_stream
-            final = flujo.get_final_message()
+        mensajes = [{"role": "user", "content": contenido}]
+        try:
+            final = yield from self._emitir(mensajes)
+        except anthropic.RateLimitError:
+            if not self.rapido:
+                raise
+            # El modo rapido tiene su propio limite: se sigue en velocidad normal
+            # (cambiar de velocidad invalida la cache, por eso no se alterna en cada pregunta)
+            self.rapido = False
+            self._t_cache = 0.0
+            final = yield from self._emitir(mensajes)
+        self._t_cache = time.monotonic()  # cada lectura renueva el TTL
         if final.stop_reason == "refusal":
             yield "\n[Claude no respondió esta pregunta.]"
         elif final.stop_reason == "max_tokens":
