@@ -6,6 +6,7 @@ import threading
 import time
 import re
 import unicodedata
+from collections import deque
 
 import anthropic
 from dotenv import load_dotenv
@@ -36,12 +37,15 @@ _RELLENO = set("""
 a al alguien algo como con cual cuales cuando de del el ella ellos en entre es esta este esto explica
 explicar explicame explicarnos la las le les lo los me mi nos o para pero podria podrias por puede
 puedes que quien se ser si sobre son su sus te tu un una uno unos unas y ya hay dime decir digan
+pasa pasaria ocurre sucede seria significa entiende entienden entendemos piensan opinan creen cree
+bueno entonces osea sea vamos ver mas muy tambien eso esa ese esos esas
 """.split())
 
 
 def _palabras_clave(texto):
     sin_tildes = unicodedata.normalize("NFKD", texto.casefold()).encode("ascii", "ignore").decode()
-    return frozenset(p for p in re.findall(r"\w+", sin_tildes) if p not in _RELLENO)
+    palabras = (p[:-1] if len(p) > 4 and p.endswith("s") else p for p in re.findall(r"\w+", sin_tildes))
+    return frozenset(p for p in palabras if p not in _RELLENO)
 
 
 class Asistente:
@@ -49,6 +53,7 @@ class Asistente:
         self.fragmentos = queue.Queue(maxsize=20)
         self.lineas = queue.Queue()
         self.preguntas = queue.Queue()
+        self.recientes = deque(maxlen=5)  # (momento, palabras clave) de las ultimas preguntas respondidas
         self.escuchando = False
         self.listo = False
         self.base = None
@@ -151,6 +156,7 @@ class Asistente:
                     continue  # sigue hablando: puede estar terminando la pregunta
                 if not self.repetida(pendiente):
                     self.cerebro.marcar_respondida(pendiente)
+                    self.recientes.append((time.monotonic(), _palabras_clave(pendiente)))
                     self.preguntas.put((pendiente, None))
                 pendiente = None
                 continue
@@ -182,7 +188,18 @@ class Asistente:
         las descarta el filtro de Claude, que recibe la lista de ya respondidas.
         """
         nueva = _palabras_clave(pregunta)
-        return bool(nueva) and any(nueva == _palabras_clave(previa) for previa in self.cerebro.respondidas)
+        if not nueva:
+            return False
+        if any(nueva == _palabras_clave(previa) for previa in self.cerebro.respondidas):
+            return True
+        # Poco despues de responder, el profesor suele repetir la pregunta con otras palabras:
+        # si comparte la mayoria de sus palabras clave con una reciente, es la misma
+        ahora = time.monotonic()
+        for momento, previa in self.recientes:
+            menor = min(len(nueva), len(previa))
+            if ahora - momento <= config.VENTANA_REPETIDAS_S and menor >= 2 and len(nueva & previa) / menor >= 0.6:
+                return True
+        return False
 
     def siguiente_pregunta(self):
         """Espera una pregunta; si se acumularon varias, salta a la mas reciente (las capturas no se saltan)."""
