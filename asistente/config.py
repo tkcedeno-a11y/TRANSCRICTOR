@@ -32,4 +32,4 @@ FRECUENCIA = 16_000
 UMBRAL_VOZ_RMS = 0.006  # por debajo se considera silencio
 SILENCIO_FIN_S = 0.4  # silencio que cierra una frase; subelo si corta a la gente a media idea
 MIN_FRASE_S = 0.6
-MAX_FRASE_S = 12.0
+MAX_FRASE_S = 8.0  # una frase mas larga se transcribe en trozos, sin esperar a que termine
