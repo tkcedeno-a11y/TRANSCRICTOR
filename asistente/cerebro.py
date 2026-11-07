@@ -33,7 +33,9 @@ compañero a la clase, a quien quiera responder o a {config.NOMBRE_USUARIO}, y t
 - hace una pregunta retórica que el mismo hablante contesta;
 - es saludo, despedida, charla sin contenido o logística de la llamada ("¿me escuchan?", "¿ven mi pantalla?");
 - pregunta a otra persona concreta por su nombre, que no es {config.NOMBRE_USUARIO};
-- continúa, repite o reformula una pregunta de <ya_respondidas>.
+- trata de lo mismo que una pregunta de <ya_respondidas>, aunque use otras palabras, otro orden o
+  añada un detalle menor (el profesor suele repetir la pregunta mientras espera respuesta);
+- no trae nada nuevo y la pregunta está en líneas anteriores: esas ya se procesaron, no las marques otra vez.
 
 Si en <en_curso> hay una pregunta que aún no se responde y la última línea la continúa, la completa o
 le añade datos (aunque la línea sola no parezca pregunta), "responder" es true y en "pregunta" va la
